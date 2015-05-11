@@ -29,7 +29,8 @@ import org.apache.kafka.clients.producer.ProducerConfig;
  * <pre>
  * {agent}.sinks.{sink}.maxBatchSize=500
  * {agent}.sinks.{sink}.maxTimeOut=500
- * {agent}.sinks.{sink}.topicHeaderKey=topic
+ * {agent}.sinks.{sink}.header.topickey=topic
+ * {agent}.sinks.{sink}.header.key=key
  * #if Event has not config the topic,used this default topic;
  * {agent}.sinks.{sink}.topic=test 
  * #The following configuration with the prefix "kafka" used only for KafkaProducer.
