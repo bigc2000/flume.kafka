@@ -34,6 +34,7 @@ import org.apache.flume.Context;
 import org.apache.flume.Event;
 import org.apache.flume.EventDeliveryException;
 import org.apache.flume.Transaction;
+import org.apache.flume.annotations.InterfaceStability.Evolving;
 import org.apache.flume.conf.Configurable;
 import org.apache.flume.conf.Configurables;
 import org.apache.flume.sink.AbstractSink;
@@ -42,7 +43,7 @@ import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
+@Evolving
 public class KafkaSink extends AbstractSink implements Configurable {
     private static final String CHARSET_KEY = "key.charset";
     private static final Logger logger = LoggerFactory.getLogger(KafkaSink.class);
@@ -90,6 +91,7 @@ public class KafkaSink extends AbstractSink implements Configurable {
         try {
 
             tx.begin();
+            sendCompletedCount.set(0);
             AtomicBoolean sendFailed = new AtomicBoolean(false);
             int eventCount = 0;
             String keyStr = null;
@@ -148,18 +150,17 @@ public class KafkaSink extends AbstractSink implements Configurable {
                     sinkCounter.incrementBatchCompleteCount();
                 }
                 sinkCounter.addToEventDrainAttemptCount(eventCount);
-
                 // add kafa metric
                 // wait callback return
                 try {
                     lock.lock();
-                    while ((sendCompletedCount.intValue() > 0) && !sendFailed.get()) {
+                    while ((sendCompletedCount.get()<eventCount) && !sendFailed.get()) {
                         try {
                             // wait.If each event send exceeded the maxSendTimeoutMs,failed.
                             if (!condition.await(maxSendTimeoutMs, TimeUnit.MILLISECONDS)) {
                                 sendFailed.set(true);
                                 sinkCounter.incrementKafkaSendTimeoutCount();
-                                logger.warn("Condition.await timed out, waitted {} ms", maxSendTimeoutMs);
+                                logger.warn("send event timed out, waitted {} ms", maxSendTimeoutMs);
                             }
                         } catch (InterruptedException ex) {
                             Thread.sleep(0);
@@ -172,6 +173,13 @@ public class KafkaSink extends AbstractSink implements Configurable {
                 }
                 if (sendFailed.get()) {
                     shouldCommit = false;
+                    //this metrics is not actually event count sent, because after send() called,
+                    //we cannot cancel send task, and doesnot know exactly success count.
+                    sinkCounter.addToEventDrainSuccessCount(sendCompletedCount.get());
+                }
+                else
+                {
+                  sinkCounter.addToEventDrainSuccessCount(eventCount);  
                 }
                 sendEndTime = System.currentTimeMillis();
                 sinkCounter.addToKafkaEventSendTimer(sendEndTime - sendStartTime);
@@ -184,10 +192,12 @@ public class KafkaSink extends AbstractSink implements Configurable {
             }
             // log
             if (logger.isDebugEnabled() && eventCount > 0) {
-                if (shouldCommit) {
-                    logger.debug("Send {} events to Producer succ, cost {} ms", eventCount, sendEndTime - sendStartTime);
-                } else {
-                    logger.debug("Send {} events to Producer fail, cost at least {} ms", eventCount,
+                if (shouldCommit) 
+                {
+                    logger.debug("Send {} events successful, cost {} ms", eventCount, sendEndTime - sendStartTime);
+                } else 
+                {
+                    logger.debug("Send {} events failed, cost at least {} ms", eventCount,
                             System.currentTimeMillis() - sendStartTime);
                 }
             }
@@ -205,7 +215,6 @@ public class KafkaSink extends AbstractSink implements Configurable {
         } finally {
             tx.close();
         }
-
         return status;
     }
 
@@ -235,7 +244,6 @@ public class KafkaSink extends AbstractSink implements Configurable {
         if (logger.isDebugEnabled()) {
             logger.debug(formatConf(context, kafkaProducerProps));
         }
-
         logger.info("Sink Config: maxBatchSize: " + maxBatchSize + ", maxTimeoutMs: " + maxSendTimeoutMs);
     }
 
