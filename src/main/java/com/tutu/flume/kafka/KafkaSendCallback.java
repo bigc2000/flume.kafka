@@ -58,10 +58,6 @@ public class KafkaSendCallback implements Callback {
     @Override
     public void onCompletion(RecordMetadata metadata, Exception ex) {
         if (ex == null) {
-            if (logger.isDebugEnabled()) {
-                logger.debug(String.format("send event %d success,topic:%s,partition:%d,offset:%d",index, metadata.topic(), metadata.partition(),
-                        metadata.offset()));
-            }
             sendCompletedCounter.incrementAndGet();
         } else {
             logger.debug("send event {} failed.",index);

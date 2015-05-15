@@ -127,7 +127,7 @@ public class KafkaSink extends AbstractSink implements Configurable {
                 if (sendFailed.get()) {
                     break;
                 }
-                producer.send(message, new KafkaSendCallback(sendFailed, sendCompletedCount, lock, condition));
+                producer.send(message, new KafkaSendCallback(sendFailed, sendCompletedCount, lock, condition,i));
                 // messageList.add(message);
             }
             long sendStartTime = 0;
@@ -152,34 +152,31 @@ public class KafkaSink extends AbstractSink implements Configurable {
                 sinkCounter.addToEventDrainAttemptCount(eventCount);
                 // add kafa metric
                 // wait callback return
-                try {
-                    lock.lock();
-                    while ((sendCompletedCount.get()<eventCount) && !sendFailed.get()) {
-                        try {
-                            // wait.If each event send exceeded the maxSendTimeoutMs,failed.
-                            if (!condition.await(maxSendTimeoutMs, TimeUnit.MILLISECONDS)) {
-                                sendFailed.set(true);
-                                sinkCounter.incrementKafkaSendTimeoutCount();
-                                logger.warn("send event timed out, waitted {} ms", maxSendTimeoutMs);
-                            }
-                        } catch (InterruptedException ex) {
-                            Thread.sleep(0);
-                        } catch (Exception ex) {
-                            logger.error("Condition.await fail, {}", ex);
+                while ((sendCompletedCount.get() < eventCount) && !sendFailed.get()) {
+                    try {
+                        // wait.If each event send exceeded the maxSendTimeoutMs,failed.
+                        lock.lock();
+                        if (!condition.await(maxSendTimeoutMs, TimeUnit.MILLISECONDS)) {
+                            sendFailed.set(true);
+                            sinkCounter.incrementKafkaSendTimeoutCount();
+                            logger.warn(String.format("eventcount:%d,sendcount:%d,timeout:%d ms", eventCount,
+                                    sendCompletedCount.get(), (int) maxSendTimeoutMs));
                         }
+                    } catch (InterruptedException ex) {
+                        Thread.sleep(0);
+                    } catch (Exception ex) {
+                        logger.error("Condition.await fail, {}", ex);
+                    } finally {
+                        lock.unlock();
                     }
-                } finally {
-                    lock.unlock();
                 }
                 if (sendFailed.get()) {
                     shouldCommit = false;
-                    //this metrics is not actually event count sent, because after send() called,
-                    //we cannot cancel send task, and doesnot know exactly success count.
+                    // this metrics is not actually event count sent, because after send() called,
+                    // we cannot cancel send task, and doesnot know exactly success count.
                     sinkCounter.addToEventDrainSuccessCount(sendCompletedCount.get());
-                }
-                else
-                {
-                  sinkCounter.addToEventDrainSuccessCount(eventCount);  
+                } else {
+                    sinkCounter.addToEventDrainSuccessCount(eventCount);
                 }
                 sendEndTime = System.currentTimeMillis();
                 sinkCounter.addToKafkaEventSendTimer(sendEndTime - sendStartTime);
