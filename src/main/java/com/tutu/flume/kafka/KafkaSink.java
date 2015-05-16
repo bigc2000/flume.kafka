@@ -37,6 +37,7 @@ import org.apache.flume.Transaction;
 import org.apache.flume.annotations.InterfaceStability.Evolving;
 import org.apache.flume.conf.Configurable;
 import org.apache.flume.conf.Configurables;
+import org.apache.flume.event.EventHelper;
 import org.apache.flume.sink.AbstractSink;
 import org.apache.kafka.clients.producer.Producer;
 import org.apache.kafka.clients.producer.ProducerConfig;
@@ -45,36 +46,35 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 @Evolving
 public class KafkaSink extends AbstractSink implements Configurable {
-    private static final String CHARSET_KEY = "key.charset";
     private static final Logger logger = LoggerFactory.getLogger(KafkaSink.class);
+
+    private static final String DEFAULT_EVENT_HEADER_KEY_VAL = "kafkakey";
+    private static final String CHARSET_KEY = "key.charset";
     public static final String KAFKA_CONFIG_PREFIX = "kafka.";
     // used in sink config only
     public static final String MAX_BATCH_SIZE_KEY = "maxBatchSize";
     public static final String SEND_TIME_OUT_KEY = "sendTimeoutMs";
     // used in Event Header
-    public static final String EVENT_HEADER_TOPIC_KEY = "header.topickey";
+    public static final String EVENT_HEADER_TOPIC_KEY = "header.topic";
     public static final String EVENT_HEADER_KAFKA_KEY = "header.key";
-
     // default value
     public static final int DEFAULT_BATCH_SIZE_VAL = 100;
-
     // if both topic and topic in even header no set,use the default topic
     public static final String DEFAULT_TOPIC_VAL = "test";
-    public static final String TOPIC_KEY = "topic";
-
     public static final int DEFAULT_SEND_TIME_OUT_VAL = 3000;
+    public static final String TOPIC_KEY = "topic";
 
     private KafkaSinkCounter sinkCounter;
     // sink config
-    private int maxBatchSize;
-    private long maxSendTimeoutMs;
+
     Producer<byte[], byte[]> producer;
     KafkaProducerConf kafkaSinkConf;
     String defaultTopic;
-    String eventTopicHeader;
-    String eventKeyHeader;
+    String eventHeaderTopic;
+    String eventHeaderKey;
+    private int maxBatchSize;
+    private long maxSendTimeoutMs;
     String charset;
-    AtomicInteger sendCompletedCount = new AtomicInteger();
     // ArrayList<ProducerRecord<byte[], byte[]>> messageList;
 
     //
@@ -89,12 +89,12 @@ public class KafkaSink extends AbstractSink implements Configurable {
         long eventStartTime = System.currentTimeMillis();
         boolean shouldCommit = true;
         try {
-
-            tx.begin();
+            AtomicInteger sendCompletedCount = new AtomicInteger();
             sendCompletedCount.set(0);
             AtomicBoolean sendFailed = new AtomicBoolean(false);
+            tx.begin();
             int eventCount = 0;
-            String keyStr = null;
+            String strKey = null;
             byte[] key = null;
             for (int i = 0; i < maxBatchSize; ++i) {
                 Event event = channel.take();
@@ -105,18 +105,23 @@ public class KafkaSink extends AbstractSink implements Configurable {
                 eventCount++;
                 String topic = defaultTopic;
                 if (event.getHeaders() != null) {
-                    keyStr = event.getHeaders().get(eventKeyHeader);
-                    if (keyStr == null) {
+                    strKey = event.getHeaders().get(eventHeaderKey);
+                    if (strKey == null) {
                         key = null;
                     } else {
-                        key = keyStr.getBytes(charset);
+                        key = strKey.getBytes(charset);
                     }
-                    String eventTopic = event.getHeaders().get(eventTopicHeader);
-                    if (eventTopic != null && !eventTopic.trim().isEmpty()) {
+                    String eventTopic = event.getHeaders().get(eventHeaderTopic);
+                    if (eventTopic == null || eventTopic.trim().isEmpty()) {
                         topic = defaultTopic;
                     }
+                    else{
+                        topic = eventTopic;
+                    }
+                    if(logger.isDebugEnabled()){
+                        logger.debug(String.format("event=%s,key=%s,topic=%s",EventHelper.dumpEvent(event),strKey,topic));
+                    }
                 }
-
                 ProducerRecord<byte[], byte[]> message = new ProducerRecord<byte[], byte[]>(topic, key, event.getBody());
                 /**
                  * !IMPORTANT,there are two choices: send message here one bye one or add to list and than batch send,
@@ -170,12 +175,14 @@ public class KafkaSink extends AbstractSink implements Configurable {
                         lock.unlock();
                     }
                 }
-                if (sendFailed.get()) {
+                // check send complete events count again
+                if (sendFailed.get() && sendCompletedCount.get() <eventCount) {
                     shouldCommit = false;
                     // this metrics is not actually event count sent, because after send() called,
                     // we cannot cancel send task, and doesnot know exactly success count.
                     sinkCounter.addToEventDrainSuccessCount(sendCompletedCount.get());
                 } else {
+                    sendFailed.set(false);
                     sinkCounter.addToEventDrainSuccessCount(eventCount);
                 }
                 sendEndTime = System.currentTimeMillis();
@@ -189,13 +196,11 @@ public class KafkaSink extends AbstractSink implements Configurable {
             }
             // log
             if (logger.isDebugEnabled() && eventCount > 0) {
-                if (shouldCommit) 
-                {
-                    logger.debug("Send {} events successful, cost {} ms", eventCount, sendEndTime - sendStartTime);
-                } else 
-                {
-                    logger.debug("Send {} events failed, cost at least {} ms", eventCount,
-                            System.currentTimeMillis() - sendStartTime);
+                if (shouldCommit) {
+                    logger.debug("Send  events successful total={},time={} ms", eventCount, sendEndTime - sendStartTime);
+                } else {
+                    logger.debug(String.format("Send events failed total=%d,success=%d,time=%d ms(at least)",
+                            eventCount, sendCompletedCount.get(), System.currentTimeMillis() - sendStartTime));
                 }
             }
         } catch (Throwable t) {
@@ -203,8 +208,7 @@ public class KafkaSink extends AbstractSink implements Configurable {
             if (t instanceof Error) {
                 throw (Error) t;
             } else if (t instanceof ChannelException) {
-                logger.error(getName() + " " + this + ", Unable to take event from channel " + channel.getName()
-                        + ". Exception folows." + t);
+                logger.error("Unable to take event from channel {}, Exception follows {}", channel.getName(),t.getMessage());
                 status = Status.BACKOFF;
             } else {
                 throw new EventDeliveryException("Failed to send events", t);
@@ -237,16 +241,18 @@ public class KafkaSink extends AbstractSink implements Configurable {
             maxSendTimeoutMs = DEFAULT_SEND_TIME_OUT_VAL;
         }
         defaultTopic = context.getString(TOPIC_KEY, DEFAULT_TOPIC_VAL);
+        eventHeaderTopic=context.getString(EVENT_HEADER_TOPIC_KEY,TOPIC_KEY);
+        eventHeaderKey = context.getString(EVENT_HEADER_KAFKA_KEY,DEFAULT_EVENT_HEADER_KEY_VAL);
         // messageList = new ArrayList<ProducerRecord<byte[], byte[]>>(maxBatchSize);
         if (logger.isDebugEnabled()) {
             logger.debug(formatConf(context, kafkaProducerProps));
         }
-        logger.info("Sink Config: maxBatchSize: " + maxBatchSize + ", maxTimeoutMs: " + maxSendTimeoutMs);
+        logger.info(basicConfigDump());
     }
 
     @Override
     public synchronized void start() {
-        logger.info("Starting {} {}", this, getName());
+        logger.info("Starting {}...", this);
         if (producer != null) {
             producer.close();
         }
@@ -254,15 +260,19 @@ public class KafkaSink extends AbstractSink implements Configurable {
         producer = defaultProducerFactory.getProducer(kafkaSinkConf.getKafkaProduderConf());
         sinkCounter.start();
         super.start();
-        logger.info("Started {} {}", this, getName());
+        logger.info("Started {}", this);
     }
 
     @Override
     public synchronized void stop() {
-        logger.info("Stoping {} {}", this, getName());
+        logger.info("Stoping {}", this);
         sinkCounter.stop();
         super.stop();
-        logger.info("Stopped {} {}", this, getName());
+        logger.info("Stopped {}", this);
+    }
+    
+    private  String basicConfigDump(){
+       return String.format("Sink:{eventHeaderTopic=%s,eventHeaderKey=%s,defaultTopic=%s,maxBatchSize=%d,maxSendTimeoutMs=%d,charset=%s}",eventHeaderTopic,eventHeaderKey,defaultTopic,maxBatchSize,maxSendTimeoutMs,charset);
     }
 
     private static String formatConf(Context ctx, Map<?, ?> kafkaProducerConfMap) {
